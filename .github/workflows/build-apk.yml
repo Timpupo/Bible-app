@@ -1,7 +1,9 @@
 name: Build PDF app (APK)
 
-# Put your PDF in the repo root, then run this workflow
-# (Actions tab > Build PDF app (APK) > Run workflow). It also runs on every upload.
+# Repo root needs: your PDF (and optionally a picture for the cover and icon).
+# Run it from Actions > Build PDF app (APK) > Run workflow. It also runs on every upload.
+# Optional pictures: name one "cover.png" (opening cover) and/or "icon.png" (app icon).
+# If you upload just one picture, it is used for both.
 
 on:
   workflow_dispatch:
@@ -25,6 +27,12 @@ jobs:
         with:
           gradle-version: "8.7"
 
+      - name: Install text and image tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y poppler-utils python3-pil
+          python3 -c "import PIL" 2>/dev/null || python3 -m pip install --break-system-packages pillow
+
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
@@ -34,9 +42,13 @@ jobs:
           PDF=$(ls -1 *.pdf 2>/dev/null | head -n1)
           if [ -z "$PDF" ]; then echo "No PDF found in the repo root. Upload your PDF first."; exit 1; fi
           echo "Using PDF: $PDF"
-          mkdir -p pdfapp && cd pdfapp
-          mkdir -p app/src/main/java/com/personal/pdfapp app/src/main/res/values app/src/main/assets
-          cat > settings.gradle <<'EOF_FILE'
+          COVER=$(ls -1 cover.* 2>/dev/null | head -n1)
+          ICON=$(ls -1 icon.* 2>/dev/null | head -n1)
+          if [ -z "$COVER" ]; then COVER=$(ls -1 *.png *.PNG *.jpg *.JPG *.jpeg *.JPEG *.webp 2>/dev/null | grep -v -i "^icon\." | head -n1); fi
+          if [ -z "$ICON" ]; then ICON="$COVER"; fi
+          echo "Cover image: ${COVER:-none}  |  Icon image: ${ICON:-none}"
+          mkdir -p pdfapp/tools pdfapp/app/src/main/java/com/personal/pdfapp pdfapp/app/src/main/res/values pdfapp/app/src/main/assets
+          cat > pdfapp/settings.gradle <<'EOF_FILE'
           pluginManagement {
               repositories {
                   google()
@@ -54,16 +66,16 @@ jobs:
           rootProject.name = "PdfApp"
           include ':app'
           EOF_FILE
-          cat > build.gradle <<'EOF_FILE'
+          cat > pdfapp/build.gradle <<'EOF_FILE'
           plugins {
               id 'com.android.application' version '8.5.2' apply false
           }
           EOF_FILE
-          cat > gradle.properties <<'EOF_FILE'
+          cat > pdfapp/gradle.properties <<'EOF_FILE'
           org.gradle.jvmargs=-Xmx2g
           android.nonTransitiveRClass=true
           EOF_FILE
-          cat > app/build.gradle <<'EOF_FILE'
+          cat > pdfapp/app/build.gradle <<'EOF_FILE'
           plugins {
               id 'com.android.application'
           }
@@ -76,8 +88,8 @@ jobs:
                   applicationId 'com.personal.pdfapp'
                   minSdk 21
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
               }
 
               androidResources {
@@ -90,10 +102,11 @@ jobs:
               }
           }
           EOF_FILE
-          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          cat > pdfapp/app/src/main/AndroidManifest.xml <<'EOF_FILE'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <application
+                  android:icon="@mipmap/ic_launcher"
                   android:label="@string/app_name"
                   android:allowBackup="false"
                   android:largeHeap="true"
@@ -109,187 +122,293 @@ jobs:
               </application>
           </manifest>
           EOF_FILE
-          cat > app/src/main/java/com/personal/pdfapp/MainActivity.java <<'EOF_FILE'
+          cat > pdfapp/app/src/main/java/com/personal/pdfapp/MainActivity.java <<'EOF_FILE'
           package com.personal.pdfapp;
 
           import android.app.Activity;
           import android.app.AlertDialog;
+          import android.content.Context;
+          import android.content.SharedPreferences;
           import android.content.res.AssetFileDescriptor;
           import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
           import android.graphics.Color;
+          import android.graphics.ColorFilter;
+          import android.graphics.ColorMatrix;
+          import android.graphics.ColorMatrixColorFilter;
+          import android.graphics.Matrix;
+          import android.graphics.Typeface;
           import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.Drawable;
           import android.graphics.pdf.PdfRenderer;
           import android.os.Bundle;
           import android.os.Handler;
           import android.os.Looper;
           import android.os.ParcelFileDescriptor;
+          import android.os.SystemClock;
           import android.text.InputType;
+          import android.text.Layout;
+          import android.text.SpannableStringBuilder;
+          import android.text.Spanned;
+          import android.text.style.AlignmentSpan;
+          import android.text.style.ForegroundColorSpan;
+          import android.text.style.RelativeSizeSpan;
+          import android.text.style.StyleSpan;
+          import android.text.style.SuperscriptSpan;
+          import android.util.DisplayMetrics;
           import android.util.LruCache;
+          import android.util.TypedValue;
+          import android.view.Gravity;
           import android.view.GestureDetector;
+          import android.view.KeyEvent;
           import android.view.Menu;
           import android.view.MenuItem;
           import android.view.MotionEvent;
           import android.view.ScaleGestureDetector;
           import android.view.View;
           import android.view.ViewGroup;
+          import android.view.animation.AccelerateInterpolator;
+          import android.view.animation.DecelerateInterpolator;
           import android.widget.AbsListView;
           import android.widget.BaseAdapter;
           import android.widget.EditText;
           import android.widget.FrameLayout;
-          import android.widget.HorizontalScrollView;
           import android.widget.ImageView;
+          import android.widget.LinearLayout;
           import android.widget.ListView;
+          import android.widget.RadioButton;
+          import android.widget.RadioGroup;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
           import android.widget.Toast;
 
+          import java.io.ByteArrayOutputStream;
           import java.io.File;
           import java.io.FileOutputStream;
           import java.io.IOException;
           import java.io.InputStream;
           import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
           import java.util.HashSet;
+          import java.util.Locale;
           import java.util.Set;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
 
           public class MainActivity extends Activity {
 
-              private static final String ASSET = "book.pdf";
-              private static final float MAX_ZOOM = 2.5f;
+              private static final String PDF_ASSET = "book.pdf";
+              private static final String TEXT_ASSET = "book.txt";
+              private static final String COVER_ASSET = "cover.jpg";
+              private static final int THEME_LIGHT = 0;
+              private static final int THEME_SEPIA = 1;
+              private static final int THEME_DARK = 2;
+              private static final String[] FONT_NAMES = {"Serif", "Sans-serif", "Light", "Casual", "Typewriter"};
+              private static final String[] THEME_NAMES = {"Light", "Sepia", "Dark"};
+              private static final Pattern VERSE = Pattern.compile("(?<![A-Za-z0-9/\\-])(\\d{1,3})(?=\\s|$)");
+              private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
 
+              // PDF
               private PdfRenderer renderer;
               private ParcelFileDescriptor pfd;
+              private final Object renderLock = new Object();
               private int pageCount;
-              private float ratio = 11f / 8.5f;
-              private int screenW;
-              private float zoom = 1f;
               private int renderWidth;
               private volatile boolean closed = false;
-
-              private ListView list;
-              private HorizontalScrollView hsv;
-              private PageAdapter adapter;
-              private Bitmap placeholder;
-              private LruCache<Long, Bitmap> cache;
-              private final Set<Long> inFlight = new HashSet<>();
+              private LruCache<Integer, Bitmap> cache;
+              private final Set<Integer> inFlight = new HashSet<>();
               private final ExecutorService exec = Executors.newSingleThreadExecutor();
               private final Handler main = new Handler(Looper.getMainLooper());
-              private ScaleGestureDetector scaleDetector;
-              private GestureDetector tapDetector;
+
+              // Screen
+              private int screenW;
+              private float density;
+              private long startTime;
+              private SharedPreferences prefs;
+
+              // State
+              private int cur = 0;
+              private boolean readingMode = false;
+              private int theme = THEME_LIGHT;
+              private int fontIdx = 0;
+              private int textSp = 18;
+              private boolean animating = false;
+
+              // Views
+              private FrameLayout root;
+              private FrameLayout stage;
+              private FrameLayout coverView;
+              private ZoomImageView viewA;
+              private ZoomImageView viewB;
+              private ListView readList;
+              private TextAdapter textAdapter;
+
+              // Text for Reading mode
+              private volatile String[] chunks;
+              private volatile boolean textFailed = false;
+
+              // ------------------------------------------------------------------ lifecycle
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
-                  screenW = getResources().getDisplayMetrics().widthPixels;
-                  renderWidth = screenW;
+                  startTime = SystemClock.uptimeMillis();
+                  DisplayMetrics dm = getResources().getDisplayMetrics();
+                  screenW = dm.widthPixels;
+                  density = dm.density;
 
+                  prefs = getSharedPreferences("reader", MODE_PRIVATE);
+                  cur = prefs.getInt("page", 0);
+                  readingMode = prefs.getBoolean("reading", false);
+                  theme = prefs.getInt("theme", THEME_LIGHT);
+                  fontIdx = prefs.getInt("font", 0);
+                  textSp = prefs.getInt("textSp", 18);
+
+                  root = new FrameLayout(this);
+                  root.setBackgroundColor(readerBg());
+                  setContentView(root);
+                  buildCover();
+                  main.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          initReader();
+                      }
+                  });
+              }
+
+              private void initReader() {
                   try {
                       File f = ensureCopied();
                       pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY);
                       renderer = new PdfRenderer(pfd);
                       pageCount = renderer.getPageCount();
-                      PdfRenderer.Page p0 = renderer.openPage(0);
-                      ratio = (float) p0.getHeight() / p0.getWidth();
-                      p0.close();
                   } catch (Exception e) {
                       Toast.makeText(this, "Could not open the book: " + e.getMessage(), Toast.LENGTH_LONG).show();
                       finish();
                       return;
                   }
-
-                  placeholder = Bitmap.createBitmap(100, Math.round(100 * ratio), Bitmap.Config.ARGB_8888);
-                  placeholder.eraseColor(Color.WHITE);
-
-                  int cacheBytes = (int) (Runtime.getRuntime().maxMemory() / 5);
-                  cache = new LruCache<Long, Bitmap>(cacheBytes) {
+                  renderWidth = Math.min(screenW * 2, 1800);
+                  cache = new LruCache<Integer, Bitmap>((int) (Runtime.getRuntime().maxMemory() / 4)) {
                       @Override
-                      protected int sizeOf(Long key, Bitmap value) {
+                      protected int sizeOf(Integer key, Bitmap value) {
                           return value.getByteCount();
                       }
                   };
+                  if (cur < 0 || cur >= pageCount) {
+                      cur = 0;
+                  }
 
-                  scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                      @Override
-                      public boolean onScale(ScaleGestureDetector d) {
-                          zoom = Math.max(1f, Math.min(MAX_ZOOM, zoom * d.getScaleFactor()));
-                          applyZoom();
-                          return true;
-                      }
+                  // Book (PDF) view: two stacked pages for the flip effect
+                  stage = new FrameLayout(this);
+                  viewA = new ZoomImageView(this);
+                  viewB = new ZoomImageView(this);
+                  viewB.setCameraDistance(density * 9000f);
+                  stage.addView(viewA, new FrameLayout.LayoutParams(MATCH, MATCH));
+                  stage.addView(viewB, new FrameLayout.LayoutParams(MATCH, MATCH));
 
-                      @Override
-                      public void onScaleEnd(ScaleGestureDetector d) {
-                          renderWidth = Math.round(screenW * zoom);
-                          adapter.notifyDataSetChanged();
-                      }
-                  });
-                  scaleDetector.setQuickScaleEnabled(false);
-
-                  tapDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
-                      @Override
-                      public boolean onDoubleTap(MotionEvent e) {
-                          zoom = zoom > 1.05f ? 1f : 2f;
-                          renderWidth = Math.round(screenW * zoom);
-                          applyZoom();
-                          if (zoom == 1f) {
-                              hsv.scrollTo(0, 0);
-                          }
-                          return true;
-                      }
-                  });
-
-                  FrameLayout root = new FrameLayout(this) {
-                      @Override
-                      public boolean dispatchTouchEvent(MotionEvent ev) {
-                          scaleDetector.onTouchEvent(ev);
-                          tapDetector.onTouchEvent(ev);
-                          return super.dispatchTouchEvent(ev);
-                      }
-                  };
-
-                  hsv = new HorizontalScrollView(this);
-                  hsv.setHorizontalScrollBarEnabled(false);
-
-                  list = new ListView(this);
-                  list.setBackgroundColor(0xFF9E9E9E);
-                  list.setDivider(new ColorDrawable(0xFF9E9E9E));
-                  list.setDividerHeight(6);
-                  list.setFastScrollEnabled(true);
-                  adapter = new PageAdapter();
-                  list.setAdapter(adapter);
-                  list.setOnScrollListener(new AbsListView.OnScrollListener() {
+                  // Reading (text) view
+                  readList = new ListView(this);
+                  readList.setDivider(new ColorDrawable(0x00000000));
+                  readList.setDividerHeight(0);
+                  readList.setFastScrollEnabled(true);
+                  textAdapter = new TextAdapter();
+                  readList.setAdapter(textAdapter);
+                  readList.setOnScrollListener(new AbsListView.OnScrollListener() {
                       @Override
                       public void onScrollStateChanged(AbsListView view, int scrollState) {
                       }
 
                       @Override
                       public void onScroll(AbsListView view, int first, int visible, int total) {
-                          setTitle("Page " + (first + 1) + " / " + pageCount);
+                          if (readingMode && total > 0) {
+                              cur = Math.max(0, Math.min(pageCount - 1, first));
+                              updateTitle();
+                          }
                       }
                   });
 
-                  hsv.addView(list, new FrameLayout.LayoutParams(screenW, ViewGroup.LayoutParams.MATCH_PARENT));
-                  root.addView(hsv, new FrameLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                  setContentView(root);
+                  root.addView(stage, 0, new FrameLayout.LayoutParams(MATCH, MATCH));
+                  root.addView(readList, 1, new FrameLayout.LayoutParams(MATCH, MATCH));
+                  applyTheme();
+                  showMode();
+                  loadTextAsync();
 
-                  int saved = getSharedPreferences("reader", MODE_PRIVATE).getInt("first", 0);
-                  if (saved > 0 && saved < pageCount) {
-                      list.setSelection(saved);
+                  if (coverView != null) {
+                      long wait = Math.max(0L, 2500L - (SystemClock.uptimeMillis() - startTime));
+                      main.postDelayed(new Runnable() {
+                          @Override
+                          public void run() {
+                              dismissCover();
+                          }
+                      }, wait);
                   }
               }
 
-              private void applyZoom() {
-                  ViewGroup.LayoutParams lp = list.getLayoutParams();
-                  lp.width = Math.round(screenW * zoom);
-                  list.setLayoutParams(lp);
-                  adapter.notifyDataSetChanged();
+              // ------------------------------------------------------------------ cover
+
+              private void buildCover() {
+                  try (InputStream in = getAssets().open(COVER_ASSET)) {
+                      Bitmap cb = BitmapFactory.decodeStream(in);
+                      if (cb == null) {
+                          return;
+                      }
+                      FrameLayout c = new FrameLayout(this);
+                      c.setBackgroundColor(0xFF000000);
+                      ImageView iv = new ImageView(this);
+                      iv.setImageBitmap(cb);
+                      iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                      c.addView(iv, new FrameLayout.LayoutParams(MATCH, MATCH));
+                      TextView tv = new TextView(this);
+                      tv.setText("Tap to open");
+                      tv.setTextColor(0xFFFFFFFF);
+                      tv.setShadowLayer(8f, 0f, 0f, 0xFF000000);
+                      tv.setPadding(0, 0, 0, dp(36));
+                      c.addView(tv, new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+                      c.setOnClickListener(new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) {
+                              dismissCover();
+                          }
+                      });
+                      coverView = c;
+                      root.addView(c, new FrameLayout.LayoutParams(MATCH, MATCH));
+                      if (getActionBar() != null) {
+                          getActionBar().hide();
+                      }
+                  } catch (Throwable ignored) {
+                      coverView = null;
+                  }
               }
+
+              private void dismissCover() {
+                  if (coverView == null) {
+                      return;
+                  }
+                  final View c = coverView;
+                  coverView = null;
+                  c.animate().alpha(0f).setDuration(350).withEndAction(new Runnable() {
+                      @Override
+                      public void run() {
+                          root.removeView(c);
+                      }
+                  }).start();
+                  if (getActionBar() != null) {
+                      getActionBar().show();
+                  }
+              }
+
+              // ------------------------------------------------------------------ PDF handling
 
               // Copies the bundled PDF byte-for-byte to app storage (PdfRenderer needs a real file).
               private File ensureCopied() throws IOException {
-                  File out = new File(getFilesDir(), ASSET);
+                  File out = new File(getFilesDir(), PDF_ASSET);
                   long len = -1;
                   try {
-                      AssetFileDescriptor afd = getAssets().openFd(ASSET);
+                      AssetFileDescriptor afd = getAssets().openFd(PDF_ASSET);
                       len = afd.getLength();
                       afd.close();
                   } catch (IOException ignored) {
@@ -297,8 +416,8 @@ jobs:
                   if (len >= 0 && out.exists() && out.length() == len) {
                       return out;
                   }
-                  File tmp = new File(getFilesDir(), ASSET + ".tmp");
-                  try (InputStream in = getAssets().open(ASSET); OutputStream os = new FileOutputStream(tmp)) {
+                  File tmp = new File(getFilesDir(), PDF_ASSET + ".tmp");
+                  try (InputStream in = getAssets().open(PDF_ASSET); OutputStream os = new FileOutputStream(tmp)) {
                       byte[] buf = new byte[1 << 16];
                       int n;
                       while ((n = in.read(buf)) > 0) {
@@ -314,19 +433,16 @@ jobs:
                   return out;
               }
 
-              private static long keyOf(int page, int width) {
-                  return (((long) width) << 32) | (page & 0xFFFFFFFFL);
-              }
-
               private Bitmap renderPage(int page, int w) {
                   try {
-                      synchronized (this) {
+                      synchronized (renderLock) {
                           if (closed) {
                               return null;
                           }
                           PdfRenderer.Page p = renderer.openPage(page);
                           int h = Math.round(w * (float) p.getHeight() / p.getWidth());
                           Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                          bmp.setDensity(Bitmap.DENSITY_NONE);
                           bmp.eraseColor(Color.WHITE);
                           p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
                           p.close();
@@ -337,32 +453,34 @@ jobs:
                   }
               }
 
-              private void schedule(final int page, final int w) {
-                  if (page < 0 || page >= pageCount) {
-                      return;
+              private Bitmap pageBitmap(int page) {
+                  Bitmap b = cache.get(page);
+                  if (b == null) {
+                      b = renderPage(page, renderWidth);
+                      if (b == null) {
+                          b = Bitmap.createBitmap(100, 130, Bitmap.Config.ARGB_8888);
+                          b.eraseColor(Color.WHITE);
+                      } else {
+                          cache.put(page, b);
+                      }
                   }
-                  final long key = keyOf(page, w);
-                  if (cache.get(key) != null || !inFlight.add(key)) {
+                  return b;
+              }
+
+              private void prefetch(final int page) {
+                  if (page < 0 || page >= pageCount || cache.get(page) != null || !inFlight.add(page)) {
                       return;
                   }
                   exec.execute(new Runnable() {
                       @Override
                       public void run() {
-                          final Bitmap result = renderPage(page, w);
+                          final Bitmap r = renderPage(page, renderWidth);
                           main.post(new Runnable() {
                               @Override
                               public void run() {
-                                  inFlight.remove(key);
-                                  if (result == null || closed) {
-                                      return;
-                                  }
-                                  cache.put(key, result);
-                                  for (int i = 0; i < list.getChildCount(); i++) {
-                                      View c = list.getChildAt(i);
-                                      Object tag = c.getTag();
-                                      if (tag instanceof Long && ((Long) tag).longValue() == key) {
-                                          ((ImageView) c).setImageBitmap(result);
-                                      }
+                                  inFlight.remove(page);
+                                  if (r != null && !closed) {
+                                      cache.put(page, r);
                                   }
                               }
                           });
@@ -370,7 +488,279 @@ jobs:
                   });
               }
 
-              private class PageAdapter extends BaseAdapter {
+              // ------------------------------------------------------------------ book view + page flip
+
+              private void showPageNow(int page) {
+                  cur = Math.max(0, Math.min(pageCount - 1, page));
+                  Bitmap b = pageBitmap(cur);
+                  viewB.animate().cancel();
+                  viewB.setRotationY(0f);
+                  viewB.setAlpha(1f);
+                  animating = false;
+                  viewA.setPageBitmap(b);
+                  viewB.setPageBitmap(b);
+                  prefetch(cur + 1);
+                  prefetch(cur - 1);
+                  updateTitle();
+              }
+
+              private void goNext() {
+                  if (animating || readingMode || cur >= pageCount - 1) {
+                      return;
+                  }
+                  flip(true);
+              }
+
+              private void goPrev() {
+                  if (animating || readingMode || cur <= 0) {
+                      return;
+                  }
+                  flip(false);
+              }
+
+              private void flip(final boolean forward) {
+                  animating = true;
+                  final int target = forward ? cur + 1 : cur - 1;
+                  final Bitmap tb = pageBitmap(target);
+                  final Bitmap cb = pageBitmap(cur);
+                  viewB.setPivotX(0f);
+                  viewB.setPivotY(viewB.getHeight() / 2f);
+                  if (forward) {
+                      viewA.setPageBitmap(tb);
+                      viewB.setPageBitmap(cb);
+                      viewB.setRotationY(0f);
+                      viewB.setAlpha(1f);
+                      viewB.animate().rotationY(-90f).setDuration(380)
+                              .setInterpolator(new AccelerateInterpolator())
+                              .setUpdateListener(new android.animation.ValueAnimator.AnimatorUpdateListener() {
+                                  @Override
+                                  public void onAnimationUpdate(android.animation.ValueAnimator a) {
+                                      viewB.setAlpha(1f - 0.5f * a.getAnimatedFraction());
+                                  }
+                              })
+                              .withEndAction(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      finishFlip(target, tb);
+                                  }
+                              }).start();
+                  } else {
+                      viewA.setPageBitmap(cb);
+                      viewB.setPageBitmap(tb);
+                      viewB.setRotationY(-90f);
+                      viewB.setAlpha(0.5f);
+                      viewB.animate().rotationY(0f).setDuration(380)
+                              .setInterpolator(new DecelerateInterpolator())
+                              .setUpdateListener(new android.animation.ValueAnimator.AnimatorUpdateListener() {
+                                  @Override
+                                  public void onAnimationUpdate(android.animation.ValueAnimator a) {
+                                      viewB.setAlpha(0.5f + 0.5f * a.getAnimatedFraction());
+                                  }
+                              })
+                              .withEndAction(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      finishFlip(target, tb);
+                                  }
+                              }).start();
+                  }
+              }
+
+              private void finishFlip(int target, Bitmap tb) {
+                  cur = target;
+                  viewB.setRotationY(0f);
+                  viewB.setAlpha(1f);
+                  viewA.setPageBitmap(tb);
+                  viewB.setPageBitmap(tb);
+                  animating = false;
+                  prefetch(cur + 1);
+                  prefetch(cur - 1);
+                  updateTitle();
+              }
+
+              // Image view that supports pinch zoom, panning, double-tap zoom and flip gestures.
+              private class ZoomImageView extends ImageView {
+                  private final Matrix m = new Matrix();
+                  private final float[] v = new float[9];
+                  private float base = 1f;
+                  private float bw = 1f;
+                  private float bh = 1f;
+                  private final ScaleGestureDetector sd;
+                  private final GestureDetector gd;
+
+                  ZoomImageView(Context c) {
+                      super(c);
+                      setScaleType(ScaleType.MATRIX);
+                      sd = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                          @Override
+                          public boolean onScale(ScaleGestureDetector d) {
+                              float now = currentScale();
+                              float target = Math.max(base, Math.min(base * 4f, now * d.getScaleFactor()));
+                              float f = target / now;
+                              m.postScale(f, f, d.getFocusX(), d.getFocusY());
+                              fix();
+                              setImageMatrix(m);
+                              return true;
+                          }
+                      });
+                      sd.setQuickScaleEnabled(false);
+                      gd = new GestureDetector(c, new GestureDetector.SimpleOnGestureListener() {
+                          @Override
+                          public boolean onDown(MotionEvent e) {
+                              return true;
+                          }
+
+                          @Override
+                          public boolean onScroll(MotionEvent e1, MotionEvent e2, float dx, float dy) {
+                              if (isZoomed() && !sd.isInProgress()) {
+                                  m.postTranslate(-dx, -dy);
+                                  fix();
+                                  setImageMatrix(m);
+                              }
+                              return true;
+                          }
+
+                          @Override
+                          public boolean onFling(MotionEvent e1, MotionEvent e2, float vx, float vy) {
+                              if (!isZoomed() && Math.abs(vx) > 900f && Math.abs(vx) > Math.abs(vy)) {
+                                  if (vx < 0) {
+                                      goNext();
+                                  } else {
+                                      goPrev();
+                                  }
+                                  return true;
+                              }
+                              return false;
+                          }
+
+                          @Override
+                          public boolean onDoubleTap(MotionEvent e) {
+                              if (isZoomed()) {
+                                  fitToView();
+                              } else {
+                                  float f = 2.4f;
+                                  m.postScale(f, f, e.getX(), e.getY());
+                                  fix();
+                                  setImageMatrix(m);
+                              }
+                              return true;
+                          }
+
+                          @Override
+                          public boolean onSingleTapConfirmed(MotionEvent e) {
+                              if (!isZoomed()) {
+                                  if (e.getX() > getWidth() * 0.65f) {
+                                      goNext();
+                                  } else if (e.getX() < getWidth() * 0.35f) {
+                                      goPrev();
+                                  }
+                              }
+                              return true;
+                          }
+                      });
+                  }
+
+                  void setPageBitmap(Bitmap b) {
+                      setImageBitmap(b);
+                      fitToView();
+                  }
+
+                  private float currentScale() {
+                      m.getValues(v);
+                      return v[Matrix.MSCALE_X];
+                  }
+
+                  private boolean isZoomed() {
+                      return currentScale() > base * 1.03f;
+                  }
+
+                  void fitToView() {
+                      Drawable d = getDrawable();
+                      if (d == null || getWidth() == 0 || getHeight() == 0) {
+                          return;
+                      }
+                      bw = d.getIntrinsicWidth();
+                      bh = d.getIntrinsicHeight();
+                      base = Math.min(getWidth() / bw, getHeight() / bh);
+                      m.reset();
+                      m.postScale(base, base);
+                      fix();
+                      setImageMatrix(m);
+                  }
+
+                  private void fix() {
+                      m.getValues(v);
+                      float s = v[Matrix.MSCALE_X];
+                      float w = bw * s;
+                      float h = bh * s;
+                      float tx = v[Matrix.MTRANS_X];
+                      float ty = v[Matrix.MTRANS_Y];
+                      float nx = w <= getWidth() ? (getWidth() - w) / 2f
+                              : Math.min(0f, Math.max(getWidth() - w, tx));
+                      float ny = h <= getHeight() ? (getHeight() - h) / 2f
+                              : Math.min(0f, Math.max(getHeight() - h, ty));
+                      m.postTranslate(nx - tx, ny - ty);
+                  }
+
+                  @Override
+                  protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+                      super.onSizeChanged(w, h, oldw, oldh);
+                      fitToView();
+                  }
+
+                  @Override
+                  public boolean onTouchEvent(MotionEvent ev) {
+                      if (animating) {
+                          return true;
+                      }
+                      sd.onTouchEvent(ev);
+                      gd.onTouchEvent(ev);
+                      return true;
+                  }
+              }
+
+              // ------------------------------------------------------------------ reading mode
+
+              private void loadTextAsync() {
+                  exec.execute(new Runnable() {
+                      @Override
+                      public void run() {
+                          try (InputStream in = getAssets().open(TEXT_ASSET)) {
+                              ByteArrayOutputStream bos = new ByteArrayOutputStream(6 << 20);
+                              byte[] buf = new byte[1 << 16];
+                              int n;
+                              while ((n = in.read(buf)) > 0) {
+                                  bos.write(buf, 0, n);
+                              }
+                              final String[] arr = new String(bos.toByteArray(), StandardCharsets.UTF_8).split("\f", -1);
+                              main.post(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      if (closed) {
+                                          return;
+                                      }
+                                      chunks = arr;
+                                      if (textAdapter != null) {
+                                          textAdapter.notifyDataSetChanged();
+                                      }
+                                  }
+                              });
+                          } catch (Throwable t) {
+                              textFailed = true;
+                              main.post(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      if (textAdapter != null) {
+                                          textAdapter.notifyDataSetChanged();
+                                      }
+                                  }
+                              });
+                          }
+                      }
+                  });
+              }
+
+              private class TextAdapter extends BaseAdapter {
                   @Override
                   public int getCount() {
                       return pageCount;
@@ -388,41 +778,251 @@ jobs:
 
                   @Override
                   public View getView(int position, View convertView, ViewGroup parent) {
-                      ImageView iv = (ImageView) convertView;
-                      if (iv == null) {
-                          iv = new ImageView(MainActivity.this);
-                          iv.setAdjustViewBounds(true);
-                          iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                          iv.setLayoutParams(new AbsListView.LayoutParams(
-                                  ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                      TextView tv = (TextView) convertView;
+                      if (tv == null) {
+                          tv = new TextView(MainActivity.this);
+                          tv.setPadding(dp(18), dp(14), dp(18), dp(20));
+                          tv.setLayoutParams(new AbsListView.LayoutParams(MATCH, WRAP));
+                          tv.setLineSpacing(0f, 1.3f);
                       }
-                      long key = keyOf(position, renderWidth);
-                      iv.setTag(Long.valueOf(key));
-                      Bitmap b = cache.get(key);
-                      if (b != null) {
-                          iv.setImageBitmap(b);
+                      tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, textSp);
+                      tv.setTypeface(typefaceFor(fontIdx));
+                      tv.setTextColor(textColor());
+                      tv.setText(buildText(position));
+                      return tv;
+                  }
+              }
+
+              private CharSequence buildText(int page) {
+                  String[] ch = chunks;
+                  if (ch == null) {
+                      return textFailed ? "Reading mode text is not available in this build." : "Preparing reading mode...";
+                  }
+                  String raw = page < ch.length ? ch[page] : "";
+                  SpannableStringBuilder sb = new SpannableStringBuilder();
+                  boolean toc = raw.contains("\u2026");
+                  for (String blk : raw.split("\n")) {
+                      if (blk.isEmpty()) {
+                          continue;
+                      }
+                      int start = sb.length();
+                      if (blk.startsWith("#")) {
+                          sb.append(blk.substring(1).trim());
+                          sb.setSpan(new StyleSpan(Typeface.BOLD), start, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                          sb.setSpan(new RelativeSizeSpan(1.3f), start, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                          sb.setSpan(new ForegroundColorSpan(accentColor()), start, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                       } else {
-                          iv.setImageBitmap(placeholder);
-                          schedule(position, renderWidth);
+                          sb.append(blk);
+                          if (!toc) {
+                              markVerses(sb, start, sb.length());
+                          }
                       }
-                      schedule(position + 1, renderWidth);
-                      return iv;
+                      sb.append("\n\n");
+                  }
+                  if (sb.length() == 0) {
+                      int s0 = sb.length();
+                      sb.append("[ picture or blank page ]\n\n");
+                      sb.setSpan(new ForegroundColorSpan(0xFF888888), s0, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  }
+                  int s = sb.length();
+                  sb.append("\u2014 " + (page + 1) + " \u2014");
+                  sb.setSpan(new ForegroundColorSpan(0xFF888888), s, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  sb.setSpan(new RelativeSizeSpan(0.7f), s, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  sb.setSpan(new AlignmentSpan.Standard(Layout.Alignment.ALIGN_CENTER), s, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  return sb;
+              }
+
+              private void markVerses(SpannableStringBuilder sb, int s, int e) {
+                  String t = sb.subSequence(s, e).toString();
+                  Matcher mt = VERSE.matcher(t);
+                  while (mt.find()) {
+                      int ms = mt.start(1);
+                      String pre = t.substring(Math.max(0, ms - 9), ms).toLowerCase(Locale.ROOT);
+                      if (pre.endsWith("chapter ") || pre.endsWith("psalm ") || pre.endsWith("psalms ")
+                              || pre.endsWith("page ") || pre.endsWith("pages ") || pre.endsWith("verse ")
+                              || pre.endsWith("verses ") || pre.endsWith("book ")) {
+                          continue;
+                      }
+                      int a = s + ms;
+                      int b = s + mt.end(1);
+                      sb.setSpan(new SuperscriptSpan(), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                      sb.setSpan(new RelativeSizeSpan(0.75f), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                      sb.setSpan(new ForegroundColorSpan(accentColor()), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                  }
+              }
+
+              private Typeface typefaceFor(int i) {
+                  switch (i) {
+                      case 1:
+                          return Typeface.SANS_SERIF;
+                      case 2:
+                          return Typeface.create("sans-serif-light", Typeface.NORMAL);
+                      case 3:
+                          return Typeface.create("casual", Typeface.NORMAL);
+                      case 4:
+                          return Typeface.MONOSPACE;
+                      default:
+                          return Typeface.SERIF;
+                  }
+              }
+
+              // ------------------------------------------------------------------ theme
+
+              private int readerBg() {
+                  if (theme == THEME_DARK) {
+                      return 0xFF121212;
+                  }
+                  if (theme == THEME_SEPIA) {
+                      return 0xFFF4ECD8;
+                  }
+                  return 0xFFFFFFFF;
+              }
+
+              private int stageBg() {
+                  if (theme == THEME_DARK) {
+                      return 0xFF050505;
+                  }
+                  if (theme == THEME_SEPIA) {
+                      return 0xFFD9C9A3;
+                  }
+                  return 0xFFC8C8C8;
+              }
+
+              private int textColor() {
+                  if (theme == THEME_DARK) {
+                      return 0xFFD8D8D8;
+                  }
+                  if (theme == THEME_SEPIA) {
+                      return 0xFF5B4636;
+                  }
+                  return 0xFF222222;
+              }
+
+              private int accentColor() {
+                  return theme == THEME_DARK ? 0xFFD4A24C : 0xFF9A6B2F;
+              }
+
+              private ColorFilter pageFilter() {
+                  if (theme == THEME_DARK) {
+                      return new ColorMatrixColorFilter(new ColorMatrix(new float[]{
+                              -0.87f, 0f, 0f, 0f, 222f,
+                              0f, -0.87f, 0f, 0f, 222f,
+                              0f, 0f, -0.87f, 0f, 222f,
+                              0f, 0f, 0f, 1f, 0f}));
+                  }
+                  if (theme == THEME_SEPIA) {
+                      return new ColorMatrixColorFilter(new ColorMatrix(new float[]{
+                              0.96f, 0f, 0f, 0f, 0f,
+                              0f, 0.90f, 0f, 0f, 0f,
+                              0f, 0f, 0.76f, 0f, 0f,
+                              0f, 0f, 0f, 1f, 0f}));
+                  }
+                  return null;
+              }
+
+              private void applyTheme() {
+                  root.setBackgroundColor(readerBg());
+                  if (stage != null) {
+                      stage.setBackgroundColor(stageBg());
+                      ColorFilter f = pageFilter();
+                      viewA.setColorFilter(f);
+                      viewB.setColorFilter(f);
+                  }
+                  if (readList != null) {
+                      readList.setBackgroundColor(readerBg());
+                  }
+                  if (textAdapter != null) {
+                      textAdapter.notifyDataSetChanged();
+                  }
+              }
+
+              // ------------------------------------------------------------------ modes, title, menu
+
+              private void showMode() {
+                  stage.setVisibility(readingMode ? View.GONE : View.VISIBLE);
+                  readList.setVisibility(readingMode ? View.VISIBLE : View.GONE);
+                  if (readingMode) {
+                      readList.setSelection(cur);
+                      updateTitle();
+                  } else {
+                      showPageNow(cur);
+                  }
+                  invalidateOptionsMenu();
+              }
+
+              private void toggleMode() {
+                  if (readingMode) {
+                      cur = Math.max(0, Math.min(pageCount - 1, readList.getFirstVisiblePosition()));
+                  }
+                  readingMode = !readingMode;
+                  showMode();
+              }
+
+              private void updateTitle() {
+                  setTitle("Page " + (cur + 1) + " / " + pageCount);
+              }
+
+              private void goToPage(int page) {
+                  int p = Math.max(0, Math.min(pageCount - 1, page));
+                  if (readingMode) {
+                      cur = p;
+                      readList.setSelection(p);
+                      updateTitle();
+                  } else {
+                      showPageNow(p);
                   }
               }
 
               @Override
               public boolean onCreateOptionsMenu(Menu menu) {
-                  menu.add(0, 1, 0, "Go to page").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+                  menu.add(0, 1, 0, "Reading mode").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+                  menu.add(0, 2, 1, "Go to page").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+                  menu.add(0, 3, 2, "Settings").setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
                   return true;
               }
 
               @Override
+              public boolean onPrepareOptionsMenu(Menu menu) {
+                  MenuItem it = menu.findItem(1);
+                  if (it != null) {
+                      it.setTitle(readingMode ? "Book view" : "Reading mode");
+                  }
+                  return super.onPrepareOptionsMenu(menu);
+              }
+
+              @Override
               public boolean onOptionsItemSelected(MenuItem item) {
-                  if (item.getItemId() == 1) {
-                      showGoTo();
+                  if (pageCount == 0) {
                       return true;
                   }
-                  return super.onOptionsItemSelected(item);
+                  switch (item.getItemId()) {
+                      case 1:
+                          toggleMode();
+                          return true;
+                      case 2:
+                          showGoTo();
+                          return true;
+                      case 3:
+                          showSettings();
+                          return true;
+                      default:
+                          return super.onOptionsItemSelected(item);
+                  }
+              }
+
+              @Override
+              public boolean onKeyDown(int keyCode, KeyEvent event) {
+                  if (pageCount > 0 && !readingMode) {
+                      if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                          goNext();
+                          return true;
+                      }
+                      if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+                          goPrev();
+                          return true;
+                      }
+                  }
+                  return super.onKeyDown(keyCode, event);
               }
 
               private void showGoTo() {
@@ -434,9 +1034,7 @@ jobs:
                           .setView(input)
                           .setPositiveButton("Go", (d, w) -> {
                               try {
-                                  int n = Integer.parseInt(input.getText().toString().trim());
-                                  n = Math.max(1, Math.min(pageCount, n));
-                                  list.setSelection(n - 1);
+                                  goToPage(Integer.parseInt(input.getText().toString().trim()) - 1);
                               } catch (NumberFormatException ignored) {
                               }
                           })
@@ -444,20 +1042,123 @@ jobs:
                           .show();
               }
 
+              private TextView label(String s) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+                  t.setTextColor(0xFF333333);
+                  t.setPadding(0, dp(14), 0, dp(4));
+                  return t;
+              }
+
+              private void showSettings() {
+                  LinearLayout box = new LinearLayout(this);
+                  box.setOrientation(LinearLayout.VERTICAL);
+                  box.setPadding(dp(20), dp(8), dp(20), dp(8));
+
+                  box.addView(label("Theme"));
+                  RadioGroup tg = new RadioGroup(this);
+                  for (int i = 0; i < THEME_NAMES.length; i++) {
+                      RadioButton rb = new RadioButton(this);
+                      rb.setText(THEME_NAMES[i]);
+                      rb.setId(200 + i);
+                      tg.addView(rb);
+                  }
+                  tg.check(200 + theme);
+                  tg.setOnCheckedChangeListener((g, id) -> {
+                      theme = id - 200;
+                      applyTheme();
+                      savePrefs();
+                  });
+                  box.addView(tg);
+
+                  final TextView sizeLabel = label("Text size (Reading mode): " + textSp);
+                  box.addView(sizeLabel);
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMax(24);
+                  sb.setProgress(textSp - 12);
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          textSp = 12 + p;
+                          sizeLabel.setText("Text size (Reading mode): " + textSp);
+                          if (textAdapter != null) {
+                              textAdapter.notifyDataSetChanged();
+                          }
+                          savePrefs();
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) {
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) {
+                      }
+                  });
+                  box.addView(sb);
+
+                  box.addView(label("Font style (Reading mode)"));
+                  RadioGroup fg = new RadioGroup(this);
+                  for (int i = 0; i < FONT_NAMES.length; i++) {
+                      RadioButton rb = new RadioButton(this);
+                      rb.setText(FONT_NAMES[i]);
+                      rb.setTypeface(typefaceFor(i));
+                      rb.setId(100 + i);
+                      fg.addView(rb);
+                  }
+                  fg.check(100 + fontIdx);
+                  fg.setOnCheckedChangeListener((g, id) -> {
+                      fontIdx = id - 100;
+                      if (textAdapter != null) {
+                          textAdapter.notifyDataSetChanged();
+                      }
+                      savePrefs();
+                  });
+                  box.addView(fg);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(box);
+                  new AlertDialog.Builder(this)
+                          .setTitle("Settings")
+                          .setView(scroll)
+                          .setPositiveButton("Done", null)
+                          .show();
+              }
+
+              // ------------------------------------------------------------------ misc
+
+              private int dp(int v) {
+                  return Math.round(v * density);
+              }
+
+              private void savePrefs() {
+                  if (pageCount == 0) {
+                      return;
+                  }
+                  if (readingMode && readList != null) {
+                      cur = Math.max(0, Math.min(pageCount - 1, readList.getFirstVisiblePosition()));
+                  }
+                  prefs.edit()
+                          .putInt("page", cur)
+                          .putBoolean("reading", readingMode)
+                          .putInt("theme", theme)
+                          .putInt("font", fontIdx)
+                          .putInt("textSp", textSp)
+                          .apply();
+              }
+
               @Override
               protected void onPause() {
                   super.onPause();
-                  if (list != null) {
-                      getSharedPreferences("reader", MODE_PRIVATE).edit()
-                              .putInt("first", list.getFirstVisiblePosition()).apply();
-                  }
+                  savePrefs();
               }
 
               @Override
               protected void onDestroy() {
                   super.onDestroy();
                   exec.shutdownNow();
-                  synchronized (this) {
+                  synchronized (renderLock) {
                       closed = true;
                       try {
                           if (renderer != null) {
@@ -472,9 +1173,113 @@ jobs:
               }
           }
           EOF_FILE
-          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">%s</string>\n</resources>\n' "$APP_NAME" > app/src/main/res/values/strings.xml
-          cp "../$PDF" app/src/main/assets/book.pdf
-          cmp "../$PDF" app/src/main/assets/book.pdf && echo "PDF copied unchanged"
+          cat > pdfapp/tools/prep_text.py <<'EOF_FILE'
+          import re
+          import sys
+
+          raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          pages = raw.split("\f")
+          if pages and not pages[-1].strip():
+              pages = pages[:-1]
+
+          HEAD = re.compile(r"^.{1,70}?\sChapter\s*\d+$")
+          LEADER = re.compile(r"\.{4,}")
+          END_PUNCT = re.compile(r'[.;:!?"\u201d\u2019)\u2026]$')
+
+
+          def is_title(line, is_last):
+              return (not is_last and len(line) <= 45 and line[0].isupper()
+                      and "," not in line and not re.search(r"\d", line)
+                      and not END_PUNCT.search(line))
+
+
+          out = []
+          for page in pages:
+              lines = [re.sub(r"\s+", " ", l).strip() for l in page.split("\n")]
+              lines = [l for l in lines if l]
+              if lines and re.fullmatch(r"\d{1,4}", lines[-1]):
+                  lines.pop()
+              blocks = []
+              cur = []
+
+              def flush():
+                  if cur:
+                      blocks.append(" ".join(cur))
+                      del cur[:]
+
+              for i, l in enumerate(lines):
+                  last = i == len(lines) - 1
+                  if HEAD.match(l) or is_title(l, last):
+                      flush()
+                      blocks.append("#" + l)
+                  elif LEADER.search(l):
+                      flush()
+                      blocks.append(LEADER.sub(" \u2026 ", l))
+                  else:
+                      cur.append(l)
+              flush()
+              out.append("\n".join(blocks))
+
+          open(sys.argv[2], "w", encoding="utf-8").write("\f".join(out))
+          print("pages:", len(out), "chars:", sum(len(p) for p in out))
+          EOF_FILE
+          cat > pdfapp/tools/make_images.py <<'EOF_FILE'
+          import os
+          import sys
+          from PIL import Image, ImageDraw
+
+          cover_path = sys.argv[1] if len(sys.argv) > 1 else ""
+          icon_path = sys.argv[2] if len(sys.argv) > 2 else ""
+          res = "app/src/main/res"
+          assets = "app/src/main/assets"
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+
+          def default_icon(size=512):
+              im = Image.new("RGB", (size, size), (22, 38, 84))
+              d = ImageDraw.Draw(im)
+              gold = (232, 192, 84)
+              w = size // 9
+              c = size // 2
+              d.rectangle([c - w // 2, size // 6, c + w // 2, size - size // 6], fill=gold)
+              d.rectangle([size // 4, c - size // 3 + size // 6, size - size // 4, c - size // 3 + size // 6 + w], fill=gold)
+              return im
+
+
+          def square(im):
+              w, h = im.size
+              s = min(w, h)
+              return im.crop(((w - s) // 2, (h - s) // 2, (w - s) // 2 + s, (h - s) // 2 + s))
+
+
+          if cover_path and os.path.exists(cover_path):
+              cov = Image.open(cover_path).convert("RGB")
+              cov.thumbnail((1600, 1600))
+              os.makedirs(assets, exist_ok=True)
+              cov.save(os.path.join(assets, "cover.jpg"), "JPEG", quality=90)
+              print("cover created from", cover_path)
+          else:
+              print("no cover image supplied")
+
+          if icon_path and os.path.exists(icon_path):
+              icon = square(Image.open(icon_path).convert("RGB"))
+              print("icon created from", icon_path)
+          else:
+              icon = default_icon()
+              print("using default icon")
+
+          for name, px in sizes.items():
+              d = os.path.join(res, "mipmap-" + name)
+              os.makedirs(d, exist_ok=True)
+              icon.resize((px, px), Image.LANCZOS).save(os.path.join(d, "ic_launcher.png"), "PNG")
+          EOF_FILE
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">%s</string>\n</resources>\n' "$APP_NAME" > pdfapp/app/src/main/res/values/strings.xml
+          cp "$PDF" pdfapp/app/src/main/assets/book.pdf
+          cmp "$PDF" pdfapp/app/src/main/assets/book.pdf && echo "PDF copied unchanged"
+          pdftotext "$PDF" raw.txt
+          cd pdfapp
+          python3 tools/prep_text.py ../raw.txt app/src/main/assets/book.txt
+          if [ -n "$COVER" ]; then python3 tools/make_images.py "../$COVER" "../$ICON"; else python3 tools/make_images.py "" ""; fi
 
       - name: Build APK
         working-directory: pdfapp
@@ -485,6 +1290,7 @@ jobs:
           PDF=$(ls -1 *.pdf | head -n1)
           unzip -p pdfapp/app/build/outputs/apk/debug/app-debug.apk assets/book.pdf | cmp - "$PDF"
           echo "Verified: PDF inside the APK is byte-for-byte identical."
+          unzip -l pdfapp/app/build/outputs/apk/debug/app-debug.apk | grep -E "assets/(book.pdf|book.txt|cover.jpg)" || true
           sha256sum "$PDF"
 
       - uses: actions/upload-artifact@v4
