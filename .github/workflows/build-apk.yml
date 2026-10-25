@@ -1,0 +1,493 @@
+name: Build PDF app (APK)
+
+# Put your PDF in the repo root, then run this workflow
+# (Actions tab > Build PDF app (APK) > Run workflow). It also runs on every upload.
+
+on:
+  workflow_dispatch:
+  push:
+
+env:
+  APP_NAME: "Ethiopian Bible"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Generate Android project around your PDF
+        run: |
+          set -e
+          PDF=$(ls -1 *.pdf 2>/dev/null | head -n1)
+          if [ -z "$PDF" ]; then echo "No PDF found in the repo root. Upload your PDF first."; exit 1; fi
+          echo "Using PDF: $PDF"
+          mkdir -p pdfapp && cd pdfapp
+          mkdir -p app/src/main/java/com/personal/pdfapp app/src/main/res/values app/src/main/assets
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PdfApp"
+          include ':app'
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          cat > app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.personal.pdfapp'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.personal.pdfapp'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              androidResources {
+                  noCompress 'pdf'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:allowBackup="false"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/com/personal/pdfapp/MainActivity.java <<'EOF_FILE'
+          package com.personal.pdfapp;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.res.AssetFileDescriptor;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.pdf.PdfRenderer;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.ParcelFileDescriptor;
+          import android.text.InputType;
+          import android.util.LruCache;
+          import android.view.GestureDetector;
+          import android.view.Menu;
+          import android.view.MenuItem;
+          import android.view.MotionEvent;
+          import android.view.ScaleGestureDetector;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.AbsListView;
+          import android.widget.BaseAdapter;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.HorizontalScrollView;
+          import android.widget.ImageView;
+          import android.widget.ListView;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.HashSet;
+          import java.util.Set;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          public class MainActivity extends Activity {
+
+              private static final String ASSET = "book.pdf";
+              private static final float MAX_ZOOM = 2.5f;
+
+              private PdfRenderer renderer;
+              private ParcelFileDescriptor pfd;
+              private int pageCount;
+              private float ratio = 11f / 8.5f;
+              private int screenW;
+              private float zoom = 1f;
+              private int renderWidth;
+              private volatile boolean closed = false;
+
+              private ListView list;
+              private HorizontalScrollView hsv;
+              private PageAdapter adapter;
+              private Bitmap placeholder;
+              private LruCache<Long, Bitmap> cache;
+              private final Set<Long> inFlight = new HashSet<>();
+              private final ExecutorService exec = Executors.newSingleThreadExecutor();
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private ScaleGestureDetector scaleDetector;
+              private GestureDetector tapDetector;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  screenW = getResources().getDisplayMetrics().widthPixels;
+                  renderWidth = screenW;
+
+                  try {
+                      File f = ensureCopied();
+                      pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY);
+                      renderer = new PdfRenderer(pfd);
+                      pageCount = renderer.getPageCount();
+                      PdfRenderer.Page p0 = renderer.openPage(0);
+                      ratio = (float) p0.getHeight() / p0.getWidth();
+                      p0.close();
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Could not open the book: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                      finish();
+                      return;
+                  }
+
+                  placeholder = Bitmap.createBitmap(100, Math.round(100 * ratio), Bitmap.Config.ARGB_8888);
+                  placeholder.eraseColor(Color.WHITE);
+
+                  int cacheBytes = (int) (Runtime.getRuntime().maxMemory() / 5);
+                  cache = new LruCache<Long, Bitmap>(cacheBytes) {
+                      @Override
+                      protected int sizeOf(Long key, Bitmap value) {
+                          return value.getByteCount();
+                      }
+                  };
+
+                  scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      @Override
+                      public boolean onScale(ScaleGestureDetector d) {
+                          zoom = Math.max(1f, Math.min(MAX_ZOOM, zoom * d.getScaleFactor()));
+                          applyZoom();
+                          return true;
+                      }
+
+                      @Override
+                      public void onScaleEnd(ScaleGestureDetector d) {
+                          renderWidth = Math.round(screenW * zoom);
+                          adapter.notifyDataSetChanged();
+                      }
+                  });
+                  scaleDetector.setQuickScaleEnabled(false);
+
+                  tapDetector = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+                      @Override
+                      public boolean onDoubleTap(MotionEvent e) {
+                          zoom = zoom > 1.05f ? 1f : 2f;
+                          renderWidth = Math.round(screenW * zoom);
+                          applyZoom();
+                          if (zoom == 1f) {
+                              hsv.scrollTo(0, 0);
+                          }
+                          return true;
+                      }
+                  });
+
+                  FrameLayout root = new FrameLayout(this) {
+                      @Override
+                      public boolean dispatchTouchEvent(MotionEvent ev) {
+                          scaleDetector.onTouchEvent(ev);
+                          tapDetector.onTouchEvent(ev);
+                          return super.dispatchTouchEvent(ev);
+                      }
+                  };
+
+                  hsv = new HorizontalScrollView(this);
+                  hsv.setHorizontalScrollBarEnabled(false);
+
+                  list = new ListView(this);
+                  list.setBackgroundColor(0xFF9E9E9E);
+                  list.setDivider(new ColorDrawable(0xFF9E9E9E));
+                  list.setDividerHeight(6);
+                  list.setFastScrollEnabled(true);
+                  adapter = new PageAdapter();
+                  list.setAdapter(adapter);
+                  list.setOnScrollListener(new AbsListView.OnScrollListener() {
+                      @Override
+                      public void onScrollStateChanged(AbsListView view, int scrollState) {
+                      }
+
+                      @Override
+                      public void onScroll(AbsListView view, int first, int visible, int total) {
+                          setTitle("Page " + (first + 1) + " / " + pageCount);
+                      }
+                  });
+
+                  hsv.addView(list, new FrameLayout.LayoutParams(screenW, ViewGroup.LayoutParams.MATCH_PARENT));
+                  root.addView(hsv, new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  setContentView(root);
+
+                  int saved = getSharedPreferences("reader", MODE_PRIVATE).getInt("first", 0);
+                  if (saved > 0 && saved < pageCount) {
+                      list.setSelection(saved);
+                  }
+              }
+
+              private void applyZoom() {
+                  ViewGroup.LayoutParams lp = list.getLayoutParams();
+                  lp.width = Math.round(screenW * zoom);
+                  list.setLayoutParams(lp);
+                  adapter.notifyDataSetChanged();
+              }
+
+              // Copies the bundled PDF byte-for-byte to app storage (PdfRenderer needs a real file).
+              private File ensureCopied() throws IOException {
+                  File out = new File(getFilesDir(), ASSET);
+                  long len = -1;
+                  try {
+                      AssetFileDescriptor afd = getAssets().openFd(ASSET);
+                      len = afd.getLength();
+                      afd.close();
+                  } catch (IOException ignored) {
+                  }
+                  if (len >= 0 && out.exists() && out.length() == len) {
+                      return out;
+                  }
+                  File tmp = new File(getFilesDir(), ASSET + ".tmp");
+                  try (InputStream in = getAssets().open(ASSET); OutputStream os = new FileOutputStream(tmp)) {
+                      byte[] buf = new byte[1 << 16];
+                      int n;
+                      while ((n = in.read(buf)) > 0) {
+                          os.write(buf, 0, n);
+                      }
+                  }
+                  if (out.exists()) {
+                      out.delete();
+                  }
+                  if (!tmp.renameTo(out)) {
+                      throw new IOException("could not save book file");
+                  }
+                  return out;
+              }
+
+              private static long keyOf(int page, int width) {
+                  return (((long) width) << 32) | (page & 0xFFFFFFFFL);
+              }
+
+              private Bitmap renderPage(int page, int w) {
+                  try {
+                      synchronized (this) {
+                          if (closed) {
+                              return null;
+                          }
+                          PdfRenderer.Page p = renderer.openPage(page);
+                          int h = Math.round(w * (float) p.getHeight() / p.getWidth());
+                          Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                          bmp.eraseColor(Color.WHITE);
+                          p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                          p.close();
+                          return bmp;
+                      }
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              private void schedule(final int page, final int w) {
+                  if (page < 0 || page >= pageCount) {
+                      return;
+                  }
+                  final long key = keyOf(page, w);
+                  if (cache.get(key) != null || !inFlight.add(key)) {
+                      return;
+                  }
+                  exec.execute(new Runnable() {
+                      @Override
+                      public void run() {
+                          final Bitmap result = renderPage(page, w);
+                          main.post(new Runnable() {
+                              @Override
+                              public void run() {
+                                  inFlight.remove(key);
+                                  if (result == null || closed) {
+                                      return;
+                                  }
+                                  cache.put(key, result);
+                                  for (int i = 0; i < list.getChildCount(); i++) {
+                                      View c = list.getChildAt(i);
+                                      Object tag = c.getTag();
+                                      if (tag instanceof Long && ((Long) tag).longValue() == key) {
+                                          ((ImageView) c).setImageBitmap(result);
+                                      }
+                                  }
+                              }
+                          });
+                      }
+                  });
+              }
+
+              private class PageAdapter extends BaseAdapter {
+                  @Override
+                  public int getCount() {
+                      return pageCount;
+                  }
+
+                  @Override
+                  public Object getItem(int position) {
+                      return position;
+                  }
+
+                  @Override
+                  public long getItemId(int position) {
+                      return position;
+                  }
+
+                  @Override
+                  public View getView(int position, View convertView, ViewGroup parent) {
+                      ImageView iv = (ImageView) convertView;
+                      if (iv == null) {
+                          iv = new ImageView(MainActivity.this);
+                          iv.setAdjustViewBounds(true);
+                          iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                          iv.setLayoutParams(new AbsListView.LayoutParams(
+                                  ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                      }
+                      long key = keyOf(position, renderWidth);
+                      iv.setTag(Long.valueOf(key));
+                      Bitmap b = cache.get(key);
+                      if (b != null) {
+                          iv.setImageBitmap(b);
+                      } else {
+                          iv.setImageBitmap(placeholder);
+                          schedule(position, renderWidth);
+                      }
+                      schedule(position + 1, renderWidth);
+                      return iv;
+                  }
+              }
+
+              @Override
+              public boolean onCreateOptionsMenu(Menu menu) {
+                  menu.add(0, 1, 0, "Go to page").setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
+                  return true;
+              }
+
+              @Override
+              public boolean onOptionsItemSelected(MenuItem item) {
+                  if (item.getItemId() == 1) {
+                      showGoTo();
+                      return true;
+                  }
+                  return super.onOptionsItemSelected(item);
+              }
+
+              private void showGoTo() {
+                  final EditText input = new EditText(this);
+                  input.setInputType(InputType.TYPE_CLASS_NUMBER);
+                  input.setHint("1 - " + pageCount);
+                  new AlertDialog.Builder(this)
+                          .setTitle("Go to page")
+                          .setView(input)
+                          .setPositiveButton("Go", (d, w) -> {
+                              try {
+                                  int n = Integer.parseInt(input.getText().toString().trim());
+                                  n = Math.max(1, Math.min(pageCount, n));
+                                  list.setSelection(n - 1);
+                              } catch (NumberFormatException ignored) {
+                              }
+                          })
+                          .setNegativeButton("Cancel", null)
+                          .show();
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  if (list != null) {
+                      getSharedPreferences("reader", MODE_PRIVATE).edit()
+                              .putInt("first", list.getFirstVisiblePosition()).apply();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  exec.shutdownNow();
+                  synchronized (this) {
+                      closed = true;
+                      try {
+                          if (renderer != null) {
+                              renderer.close();
+                          }
+                          if (pfd != null) {
+                              pfd.close();
+                          }
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">%s</string>\n</resources>\n' "$APP_NAME" > app/src/main/res/values/strings.xml
+          cp "../$PDF" app/src/main/assets/book.pdf
+          cmp "../$PDF" app/src/main/assets/book.pdf && echo "PDF copied unchanged"
+
+      - name: Build APK
+        working-directory: pdfapp
+        run: gradle assembleDebug --no-daemon
+
+      - name: Verify the PDF inside the APK is identical
+        run: |
+          PDF=$(ls -1 *.pdf | head -n1)
+          unzip -p pdfapp/app/build/outputs/apk/debug/app-debug.apk assets/book.pdf | cmp - "$PDF"
+          echo "Verified: PDF inside the APK is byte-for-byte identical."
+          sha256sum "$PDF"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDF-app-apk
+          path: pdfapp/app/build/outputs/apk/debug/app-debug.apk
